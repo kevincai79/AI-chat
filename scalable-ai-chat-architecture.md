@@ -410,3 +410,71 @@ CREATE INDEX idx_usage_tenant_created
 - **Phase 1 (MVP)**: BFF + SQL + Redis + single model provider + SSE.
 - **Phase 2**: Add model router, moderation pipeline, usage billing, and vector retrieval.
 - **Phase 3**: Multi-provider failover, GPU pools, multi-region read scale, advanced FinOps.
+
+
+---
+
+## 17) How to test this architecture
+
+Use a **progressive test pyramid**: local correctness → integration → load/chaos → production SLO validation.
+
+### A. Local and component tests
+- **API contract tests** for `POST /v1/chat/messages`, stream event schema, auth failures, and rate-limit responses.
+- **Prompt assembly unit tests** for truncation, summary insertion, and tool-output injection.
+- **Router policy tests** to verify model selection under cost/latency constraints.
+- **Moderation tests** for blocked, allowed, and borderline prompts.
+
+### B. Integration tests (pre-prod)
+- Stand up minimal stack: gateway, conversation service, Redis, Postgres, queue, one model backend.
+- Validate the full flow:
+  1. Create conversation.
+  2. Send streamed message.
+  3. Assert event order: `message.started` → `token.delta*` → `message.completed`.
+  4. Disconnect mid-stream and resume with `last_event_id`.
+  5. Verify final persistence in `messages` and usage records in `usage_events`.
+
+### C. Streaming reliability tests
+- Inject network interruption during SSE/WebSocket stream and assert client resume behavior.
+- Replay duplicate chunk sequence numbers and ensure dedupe.
+- Kill one stream worker during active generation and verify reconnection path and partial buffer recovery from Redis.
+
+### D. Data-layer tests
+- **Migration tests**: apply schema from scratch and from N-1 release.
+- **Query performance tests** on:
+  - message timeline reads by `conversation_id` + `created_at`.
+  - tenant usage aggregation by time window.
+- **Retention tests**: TTL/archive jobs and legal-hold exceptions.
+
+### E. Security and abuse tests
+- Authentication: expired JWT, invalid signature, tenant boundary enforcement.
+- Authorization: user cannot read/write other tenant conversations.
+- Rate limiting: burst + sustained limits at edge and gateway.
+- Prompt-injection and tool-allowlist tests (especially for function calling).
+
+### F. Load and scale tests
+- Generate synthetic traffic with mixed prompt sizes and stream durations.
+- Track these SLOs under load:
+  - first-token p95
+  - completion p95
+  - stream interruption rate
+  - queue wait time
+  - error rate
+- Run “brownout” tests: disable primary model provider and verify fallback provider routing.
+
+### G. Cost validation tests
+- Compare actual token usage vs estimated usage per request.
+- Validate routing policy shifts traffic to lower-cost models for simple prompts.
+- Measure cache hit rates (request cache + semantic cache) and resulting cost/request reduction.
+
+### H. Suggested CI/CD gates
+- **PR gate**: unit + API contract + lint.
+- **Pre-merge nightly**: integration + migration + moderate load test.
+- **Pre-release**: production-like soak test (4–24h) with failure injection.
+- **Post-deploy**: canary analysis on latency/error/cost before 100% rollout.
+
+### I. Minimal pass criteria before production
+- First-token p95 within target (e.g., <1.5s for warm path).
+- End-to-end error rate below target (e.g., <1%).
+- No cross-tenant data access in authZ tests.
+- Fallback routing proven in provider outage simulation.
+- Cost per successful conversation within budget guardrail.
